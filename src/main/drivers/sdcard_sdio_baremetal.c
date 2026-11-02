@@ -356,6 +356,10 @@ static bool sdcardSdio_poll(void)
                 if (sdcard.pendingOperation.callback) {
                     sdcard.pendingOperation.callback(SDCARD_BLOCK_OPERATION_WRITE, sdcard.pendingOperation.blockIndex, sdcard.pendingOperation.buffer, sdcard.pendingOperation.callbackData);
                 }
+
+                // Check card readiness now instead of waiting another filesystem
+                // service tick after the DMA transfer has already completed.
+                goto doMore;
             } else if (writeStatus != SD_BUSY || millis() > sdcard.operationStartTime + SDCARD_TIMEOUT_WRITE_MSEC) {
                 sdcard_reset();
 

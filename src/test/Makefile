@@ -445,6 +445,13 @@ sdcard_sdio_unittest_DEFINES := \
 		USE_SDCARD_SDIO= \
 		ENABLE_SDIO_EXTERNAL_DMA=0
 
+sdcard_sdio_poll_unittest_SRC := \
+		$(USER_DIR)/drivers/sdcard_sdio_baremetal.c
+
+sdcard_sdio_poll_unittest_DEFINES := \
+		USE_SDCARD_SDIO= \
+		ENABLE_SDIO_EXTERNAL_DMA=0
+
 msp_serial_unittest_SRC := \
 		$(USER_DIR)/msp/msp_serial.c \
 		$(USER_DIR)/common/crc.c \
