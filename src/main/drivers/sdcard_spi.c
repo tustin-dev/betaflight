@@ -1113,6 +1113,7 @@ sdcardVTable_t sdcardSpiVTable = {
 #ifdef SDCARD_PROFILING
     sdcardSpi_setProfilerCallback,
 #endif
+    .sdcard_flush = NULL,
 };
 
 #endif

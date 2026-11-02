@@ -169,11 +169,27 @@ blackbox_unittest_SRC :=  \
 		$(USER_DIR)/drivers/accgyro/gyro_sync.c \
 		$(USER_DIR)/pg/gps.c
 
+blackbox_unittest_DEFINES := \
+		USE_SDCARD= \
+		BLACKBOX_SDCARD_BUFFER_SIZE=2048
+
 blackbox_encoding_unittest_SRC :=  \
 		$(USER_DIR)/blackbox/blackbox_encoding.c \
 		$(USER_DIR)/common/encoding.c \
 		$(USER_DIR)/common/printf.c \
 		$(USER_DIR)/common/typeconversion.c
+
+sdcard_sdio_unittest_SRC := \
+		$(USER_DIR)/drivers/sdcard_sdio_baremetal.c
+
+sdcard_sdio_unittest_DEFINES := \
+		USE_SDCARD= \
+		USE_SDCARD_SDIO= \
+		ENABLE_SDIO_EXTERNAL_DMA=0
+
+asyncfatfs_flush_unittest_SRC := \
+		$(USER_DIR)/io/asyncfatfs/asyncfatfs.c \
+		$(USER_DIR)/io/asyncfatfs/fat_standard.c
 
 cli_unittest_SRC := \
 		$(USER_DIR)/cli/cli.c \

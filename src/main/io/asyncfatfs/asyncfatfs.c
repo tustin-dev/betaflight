@@ -855,9 +855,9 @@ static int afatfs_allocateCacheSector(uint32_t sectorIndex)
 }
 
 /**
- * Attempt to flush dirty cache pages out to the sdcard, returning true if all flushable data has been flushed.
+ * Queue a dirty filesystem cache page without forcing a partial driver batch.
  */
-bool afatfs_flush(void)
+static bool afatfs_flushDirtyCache(void)
 {
     if (afatfs.cacheDirtyEntries > 0) {
         // Flush the oldest flushable sector
@@ -881,7 +881,16 @@ bool afatfs_flush(void)
         }
     }
 
-    return true;
+    return !afatfs.cacheFlushInProgress;
+}
+
+/**
+ * Request a complete flush, including any write-back cache owned by the driver.
+ * Keep calling until all flushable data has reached the card.
+ */
+bool afatfs_flush(void)
+{
+    return afatfs_flushDirtyCache() && sdcard_flush();
 }
 
 /**
@@ -3572,7 +3581,7 @@ void afatfs_poll(void)
 {
     // Only attempt to continue FS operations if the card is present & ready, otherwise we would just be wasting time
     if (sdcard_poll()) {
-        afatfs_flush();
+        afatfs_flushDirtyCache();
 
         switch (afatfs.filesystemState) {
             case AFATFS_FILESYSTEM_STATE_INITIALIZATION:

@@ -45,8 +45,13 @@
 
 // Use this to speed up writing to SDCARD... asyncfatfs has limited support for multiblock write
 #define FATFS_BLOCK_CACHE_SIZE 16
-uint8_t writeCache[512 * FATFS_BLOCK_CACHE_SIZE] __attribute__ ((aligned (4)));
-uint32_t cacheCount = 0;
+static DMA_DATA_ZERO_INIT uint8_t writeCache[512 * FATFS_BLOCK_CACHE_SIZE] __attribute__ ((aligned (32)));
+static uint32_t cacheCount;
+static uint32_t cacheStartBlock;
+static timeMs_t cacheLastWriteTime;
+static bool writeUsesCache;
+
+#define SDCARD_CACHE_IDLE_FLUSH_MSEC 10
 
 static void cache_write(uint8_t *buffer)
 {
@@ -85,14 +90,28 @@ static bool sdcardSdio_isFunctional(void)
  */
 static void sdcard_reset(void)
 {
-    if (SD_Init() != 0) {
-        sdcard.failureCount++;
-        if (sdcard.failureCount >= SDCARD_MAX_CONSECUTIVE_FAILURES || !sdcard_isInserted()) {
-            sdcard.state = SDCARD_STATE_NOT_PRESENT;
-        } else {
-            sdcard.operationStartTime = millis();
-            sdcard.state = SDCARD_STATE_RESET;
-        }
+    sdcard.failureCount++;
+    if (sdcard.failureCount >= SDCARD_MAX_CONSECUTIVE_FAILURES || !sdcard_isInserted()) {
+        sdcard.state = SDCARD_STATE_NOT_PRESENT;
+        return;
+    }
+
+    sdcard.operationStartTime = millis();
+    sdcard.state = SD_Init() == SD_OK ? SDCARD_STATE_CARD_INIT_IN_PROGRESS : SDCARD_STATE_RESET;
+}
+
+// A cached block has already been accepted from the filesystem, whose source
+// buffer may have been reused. Keep that batch intact and stop accepting writes
+// on an I/O error; silently resetting the cache would discard acknowledged data.
+static void sdcard_failOperation(sdcardBlockOperation_e operation)
+{
+    sdcard_operationCompleteCallback_c callback = sdcard.pendingOperation.callback;
+    sdcard.pendingOperation.callback = NULL;
+    sdcard.state = SDCARD_STATE_NOT_PRESENT;
+    sdcard.failureCount++;
+    sdcard.multiWriteBlocksRemain = 0;
+    if (callback) {
+        callback(operation, sdcard.pendingOperation.blockIndex, NULL, sdcard.pendingOperation.callbackData);
     }
 }
 
@@ -117,8 +136,12 @@ static sdcardReceiveBlockStatus_e sdcard_receiveDataBlock(uint8_t *buffer, int c
         return SDCARD_RECEIVE_BLOCK_IN_PROGRESS;
     }
 
-    if (SD_GetState() != true) {
+    if (ret != SD_OK) {
         return SDCARD_RECEIVE_ERROR;
+    }
+
+    if (SD_GetState() != true) {
+        return SDCARD_RECEIVE_BLOCK_IN_PROGRESS;
     }
 
     return SDCARD_RECEIVE_SUCCESS;
@@ -194,6 +217,11 @@ static void sdcardSdio_init(const sdcardConfig_t *config, const spiPinConfig_t *
 {
     UNUSED(spiConfig);
 
+    cache_reset();
+    writeUsesCache = false;
+    sdcard.pendingOperation.callback = NULL;
+    sdcard.multiWriteBlocksRemain = 0;
+
     sdcard.enabled = config->mode;
     if (!sdcard.enabled) {
         sdcard.state = SDCARD_STATE_NOT_PRESENT;
@@ -254,26 +282,54 @@ static bool sdcard_isReady(void)
     return sdcard.state == SDCARD_STATE_READY || sdcard.state == SDCARD_STATE_WRITING_MULTIPLE_BLOCKS;
 }
 
+static void sdcard_startCachedWrite(void)
+{
+    if (!cacheCount || !sdcard_isReady()) {
+        return;
+    }
+
+    writeUsesCache = true;
+    sdcard.pendingOperation.callback = NULL;
+    sdcard.pendingOperation.blockIndex = cacheStartBlock;
+    sdcard.state = SDCARD_STATE_SENDING_WRITE;
+    sdcard.operationStartTime = millis();
+    if (SD_WriteBlocks_DMA(cacheStartBlock, (uint32_t *)writeCache, SDCARD_BLOCK_SIZE, cache_getCount()) != SD_OK) {
+        sdcard_failOperation(SDCARD_BLOCK_OPERATION_WRITE);
+    }
+}
+
+// SUCCESS from a cached write means the caller can reuse its buffer, not that
+// the card has committed the data. Explicit filesystem flushes use this fence.
+static bool sdcardSdio_flush(void)
+{
+    if (!sdcard_isReady()) {
+        return false;
+    }
+    if (cacheCount) {
+        sdcard_startCachedWrite();
+        return false;
+    }
+    return true;
+}
+
 /**
- * Send the stop-transmission token to complete a multi-block write.
+ * Finish a logical multi-block chain, first draining any cached tail batch.
  *
  * Returns:
- *     SDCARD_OPERATION_IN_PROGRESS - We're now waiting for that stop to complete, the card will enter
- *                                    the SDCARD_STATE_STOPPING_MULTIPLE_BLOCK_WRITE state.
+ *     SDCARD_OPERATION_IN_PROGRESS - Cached data is being written or the card is still busy.
  *     SDCARD_OPERATION_SUCCESS     - The multi-block write finished immediately, the card will enter
  *                                    the SDCARD_READY state.
  *
  */
 static sdcardOperationStatus_e sdcard_endWriteBlocks(void)
 {
-    sdcard.multiWriteBlocksRemain = 0;
-    if (sdcard.useCache) {
-        cache_reset();
+    if (cacheCount) {
+        sdcard_startCachedWrite();
+        return SDCARD_OPERATION_IN_PROGRESS;
     }
 
-    // 8 dummy clocks to guarantee N_WR clocks between the last card response and this token
+    sdcard.multiWriteBlocksRemain = 0;
 
-    // Card may choose to raise a busy (non-0xFF) signal after at most N_BR (1 byte) delay
     if (SD_GetState()) {
         sdcard.state = SDCARD_STATE_READY;
         return SDCARD_OPERATION_SUCCESS;
@@ -296,10 +352,6 @@ static bool sdcardSdio_poll(void)
         return false;
     }
 
-#ifdef SDCARD_PROFILING
-    bool profilingComplete;
-#endif
-
     doMore:
     switch (sdcard.state) {
         case SDCARD_STATE_RESET:
@@ -316,7 +368,7 @@ static bool sdcardSdio_poll(void)
                     goto doMore;
                 } else {
                     sdcard_reset();
-                    goto doMore;
+                    break;
                 }
             }
         break;
@@ -337,56 +389,54 @@ static bool sdcardSdio_poll(void)
                 goto doMore;
             } // else keep waiting for the CID to arrive
         break;
-        case SDCARD_STATE_SENDING_WRITE:
+        case SDCARD_STATE_SENDING_WRITE: {
             // Have we finished sending the write yet?
-            if (SD_CheckWrite() == SD_OK) {
+            const SD_Error_t status = SD_CheckWrite();
+            if (status == SD_OK) {
 
                 // The SD card is now busy committing that write to the card
                 sdcard.state = SDCARD_STATE_WAITING_FOR_WRITE;
-                sdcard.operationStartTime = millis();
-
                 // Since we've transmitted the buffer we can go ahead and tell the caller their operation is complete
                 if (sdcard.pendingOperation.callback) {
-                    sdcard.pendingOperation.callback(SDCARD_BLOCK_OPERATION_WRITE, sdcard.pendingOperation.blockIndex, sdcard.pendingOperation.buffer, sdcard.pendingOperation.callbackData);
+                    sdcard_operationCompleteCallback_c callback = sdcard.pendingOperation.callback;
+                    sdcard.pendingOperation.callback = NULL;
+                    callback(SDCARD_BLOCK_OPERATION_WRITE, sdcard.pendingOperation.blockIndex, sdcard.pendingOperation.buffer, sdcard.pendingOperation.callbackData);
                 }
+
+                // A fast card may already have committed the transfer. Checking
+                // now avoids adding an entire filesystem task period per block.
+                goto doMore;
+            }
+            if (status != SD_BUSY || millis() - sdcard.operationStartTime > SDCARD_TIMEOUT_WRITE_MSEC) {
+                sdcard_failOperation(SDCARD_BLOCK_OPERATION_WRITE);
             }
         break;
+        }
         case SDCARD_STATE_WAITING_FOR_WRITE:
+            if (SD_CheckWrite() != SD_OK) {
+                sdcard_failOperation(SDCARD_BLOCK_OPERATION_WRITE);
+                break;
+            }
             if (SD_GetState()) {
-#ifdef SDCARD_PROFILING
-                profilingComplete = true;
-#endif
-
                 sdcard.failureCount = 0; // Assume the card is good if it can complete a write
-
-                // Still more blocks left to write in a multi-block chain?
-                if (sdcard.multiWriteBlocksRemain > 1) {
-                    sdcard.multiWriteBlocksRemain--;
-                    sdcard.multiWriteNextBlock++;
-                    if (sdcard.useCache) {
-                        cache_reset();
-                    }
-                    sdcard.state = SDCARD_STATE_WRITING_MULTIPLE_BLOCKS;
-                } else if (sdcard.multiWriteBlocksRemain == 1) {
-                    // This function changes the sd card state for us whether immediately succesful or delayed:
-                    sdcard_endWriteBlocks();
-                } else {
-                    sdcard.state = SDCARD_STATE_READY;
+                if (writeUsesCache) {
+                    cache_reset();
+                    writeUsesCache = false;
                 }
+                sdcard.state = sdcard.multiWriteBlocksRemain ? SDCARD_STATE_WRITING_MULTIPLE_BLOCKS : SDCARD_STATE_READY;
 
 #ifdef SDCARD_PROFILING
-                if (profilingComplete && sdcard.profiler) {
+                if (sdcard.profiler) {
                     sdcard.profiler(SDCARD_BLOCK_OPERATION_WRITE, sdcard.pendingOperation.blockIndex, micros() - sdcard.pendingOperation.profileStartTime);
                 }
 #endif
-            } else if (millis() > sdcard.operationStartTime + SDCARD_TIMEOUT_WRITE_MSEC) {
+            } else if (millis() - sdcard.operationStartTime > SDCARD_TIMEOUT_WRITE_MSEC) {
                 /*
                  * The caller has already been told that their write has completed, so they will have discarded
                  * their buffer and have no hope of retrying the operation. But this should be very rare and it allows
                  * them to reuse their buffer milliseconds faster than they otherwise would.
                  */
-                sdcard_reset();
-                goto doMore;
+                sdcard_failOperation(SDCARD_BLOCK_OPERATION_WRITE);
             }
         break;
         case SDCARD_STATE_READING:
@@ -403,7 +453,9 @@ static bool sdcardSdio_poll(void)
 #endif
 
                     if (sdcard.pendingOperation.callback) {
-                        sdcard.pendingOperation.callback(
+                        sdcard_operationCompleteCallback_c callback = sdcard.pendingOperation.callback;
+                        sdcard.pendingOperation.callback = NULL;
+                        callback(
                             SDCARD_BLOCK_OPERATION_READ,
                             sdcard.pendingOperation.blockIndex,
                             sdcard.pendingOperation.buffer,
@@ -412,13 +464,14 @@ static bool sdcardSdio_poll(void)
                     }
                 break;
                 case SDCARD_RECEIVE_BLOCK_IN_PROGRESS:
-                    if (millis() <= sdcard.operationStartTime + SDCARD_TIMEOUT_READ_MSEC) {
+                    if (millis() - sdcard.operationStartTime <= SDCARD_TIMEOUT_READ_MSEC) {
                         break; // Timeout not reached yet so keep waiting
                     }
                     // Timeout has expired, so fall through to convert to a fatal error
+                    FALLTHROUGH;
 
                 case SDCARD_RECEIVE_ERROR:
-                    goto doMore;
+                    sdcard_failOperation(SDCARD_BLOCK_OPERATION_READ);
                 break;
             }
         break;
@@ -431,9 +484,14 @@ static bool sdcardSdio_poll(void)
                     sdcard.profiler(SDCARD_BLOCK_OPERATION_WRITE, sdcard.pendingOperation.blockIndex, micros() - sdcard.pendingOperation.profileStartTime);
                 }
 #endif
-            } else if (millis() > sdcard.operationStartTime + SDCARD_TIMEOUT_WRITE_MSEC) {
-                sdcard_reset();
-                goto doMore;
+            } else if (millis() - sdcard.operationStartTime > SDCARD_TIMEOUT_WRITE_MSEC) {
+                sdcard_failOperation(SDCARD_BLOCK_OPERATION_WRITE);
+            }
+        break;
+        case SDCARD_STATE_READY:
+        case SDCARD_STATE_WRITING_MULTIPLE_BLOCKS:
+            if (cacheCount && millis() - cacheLastWriteTime >= SDCARD_CACHE_IDLE_FLUSH_MSEC) {
+                sdcard_startCachedWrite();
             }
         break;
         case SDCARD_STATE_NOT_PRESENT:
@@ -460,12 +518,15 @@ static bool sdcardSdio_poll(void)
  *     SDCARD_OPERATION_IN_PROGRESS - Your buffer is currently being transmitted to the card and your callback will be
  *                                    called later to report the completion. The buffer pointer must remain valid until
  *                                    that time.
- *     SDCARD_OPERATION_SUCCESS     - Your buffer has been transmitted to the card now.
+ *     SDCARD_OPERATION_SUCCESS     - Data was copied into the driver's cache; the source buffer is reusable.
  *     SDCARD_OPERATION_BUSY        - The card is already busy and cannot accept your write
- *     SDCARD_OPERATION_FAILURE     - Your write was rejected by the card, card will be reset
+ *     SDCARD_OPERATION_FAILURE     - The write was not accepted; the caller still owns its data.
  */
 static sdcardOperationStatus_e sdcardSdio_writeBlock(uint32_t blockIndex, uint8_t *buffer, sdcard_operationCompleteCallback_c callback, uint32_t callbackData)
 {
+    if (!buffer) {
+        return SDCARD_OPERATION_FAILURE;
+    }
 
 #ifdef SDCARD_PROFILING
     sdcard.pendingOperation.profileStartTime = micros();
@@ -492,43 +553,47 @@ static sdcardOperationStatus_e sdcardSdio_writeBlock(uint32_t blockIndex, uint8_
             return SDCARD_OPERATION_BUSY;
     }
 
-    sdcard.pendingOperation.buffer = buffer;
-    sdcard.pendingOperation.blockIndex = blockIndex;
-
-    uint16_t block_count = 1;
-    if ((cache_getCount() < FATFS_BLOCK_CACHE_SIZE) &&
-        (sdcard.multiWriteBlocksRemain != 0) && sdcard.useCache) {
-        cache_write(buffer);
-        if (cache_getCount() == FATFS_BLOCK_CACHE_SIZE || sdcard.multiWriteBlocksRemain == 1) {
-            //Relocate buffer
-            buffer = (uint8_t*)writeCache;
-            //Recalculate block index
-            blockIndex -= cache_getCount() - 1;
-            block_count = cache_getCount();
-        } else {
-            sdcard.multiWriteBlocksRemain--;
-            sdcard.multiWriteNextBlock++;
-            sdcard.state = SDCARD_STATE_READY;
-            return SDCARD_OPERATION_SUCCESS;
-        }
+    if (cacheCount && blockIndex != cacheStartBlock + cache_getCount()) {
+        sdcard_startCachedWrite();
+        return SDCARD_OPERATION_BUSY;
     }
 
+    if (sdcard.useCache && sdcard.multiWriteBlocksRemain) {
+        if (!cacheCount) {
+            cacheStartBlock = blockIndex;
+        }
+        cache_write(buffer);
+        cacheLastWriteTime = millis();
+        sdcard.multiWriteBlocksRemain--;
+        sdcard.multiWriteNextBlock++;
+        sdcard.state = SDCARD_STATE_WRITING_MULTIPLE_BLOCKS;
+        if (cache_getCount() == FATFS_BLOCK_CACHE_SIZE || !sdcard.multiWriteBlocksRemain) {
+            sdcard_startCachedWrite();
+        }
+        // The private copy owns every accepted byte until a successful commit.
+        // Do not retain callbacks referring to source buffers that are reusable.
+        return SDCARD_OPERATION_SUCCESS;
+    }
+
+    sdcard.pendingOperation.buffer = buffer;
+    sdcard.pendingOperation.blockIndex = blockIndex;
     sdcard.pendingOperation.callback = callback;
     sdcard.pendingOperation.callbackData = callbackData;
     sdcard.pendingOperation.chunkIndex = 1; // (for non-DMA transfers) we've sent chunk #0 already
+    writeUsesCache = false;
     sdcard.state = SDCARD_STATE_SENDING_WRITE;
+    sdcard.operationStartTime = millis();
 
-    if (SD_WriteBlocks_DMA(blockIndex, (uint32_t*) buffer, 512, block_count) != SD_OK) {
-        /* Our write was rejected! This could be due to a bad address but we hope not to attempt that, so assume
-         * the card is broken and needs reset.
-         */
-        sdcard_reset();
+    if (SD_WriteBlocks_DMA(blockIndex, (uint32_t*) buffer, 512, 1) != SD_OK) {
+        // The operation was not accepted, so the caller retains this block.
+        sdcard.pendingOperation.callback = NULL;
+        sdcard_failOperation(SDCARD_BLOCK_OPERATION_WRITE);
+        return SDCARD_OPERATION_FAILURE;
+    }
 
-        // Announce write failure:
-        if (sdcard.pendingOperation.callback) {
-            sdcard.pendingOperation.callback(SDCARD_BLOCK_OPERATION_WRITE, sdcard.pendingOperation.blockIndex, NULL, sdcard.pendingOperation.callbackData);
-        }
-            return SDCARD_OPERATION_FAILURE;
+    if (sdcard.multiWriteBlocksRemain) {
+        sdcard.multiWriteBlocksRemain--;
+        sdcard.multiWriteNextBlock++;
     }
 
     return SDCARD_OPERATION_IN_PROGRESS;
@@ -549,6 +614,9 @@ static sdcardOperationStatus_e sdcardSdio_writeBlock(uint32_t blockIndex, uint8_
  */
 static sdcardOperationStatus_e sdcardSdio_beginWriteBlocks(uint32_t blockIndex, uint32_t blockCount)
 {
+    if (!blockCount) {
+        return SDCARD_OPERATION_FAILURE;
+    }
     if (sdcard.state != SDCARD_STATE_READY) {
         if (sdcard.state == SDCARD_STATE_WRITING_MULTIPLE_BLOCKS) {
             if (blockIndex == sdcard.multiWriteNextBlock) {
@@ -582,6 +650,9 @@ static sdcardOperationStatus_e sdcardSdio_beginWriteBlocks(uint32_t blockIndex, 
  */
 static bool sdcardSdio_readBlock(uint32_t blockIndex, uint8_t *buffer, sdcard_operationCompleteCallback_c callback, uint32_t callbackData)
 {
+    if (!buffer) {
+        return false;
+    }
     if (sdcard.state != SDCARD_STATE_READY) {
         if (sdcard.state == SDCARD_STATE_WRITING_MULTIPLE_BLOCKS) {
             if (sdcard_endWriteBlocks() != SDCARD_OPERATION_SUCCESS) {
@@ -611,15 +682,9 @@ static bool sdcardSdio_readBlock(uint32_t blockIndex, uint8_t *buffer, sdcard_op
 
         return true;
     } else {
-        sdcard_reset();
-        if (sdcard.pendingOperation.callback) {
-            sdcard.pendingOperation.callback(
-                SDCARD_BLOCK_OPERATION_READ,
-                sdcard.pendingOperation.blockIndex,
-                NULL,
-                sdcard.pendingOperation.callbackData
-            );
-        }
+        // A rejected start did not acquire the caller's buffer or callback.
+        sdcard.pendingOperation.callback = NULL;
+        sdcard_failOperation(SDCARD_BLOCK_OPERATION_READ);
         return false;
     }
 }
@@ -659,5 +724,6 @@ sdcardVTable_t sdcardSdioVTable = {
 #ifdef SDCARD_PROFILING
     sdcardSdio_setProfilerCallback,
 #endif
+    .sdcard_flush = sdcardSdio_flush,
 };
 #endif

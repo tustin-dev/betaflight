@@ -16,6 +16,9 @@
 
 #include <stdint.h>
 #include <string.h>
+#include <algorithm>
+#include <string>
+#include <vector>
 
 extern "C" {
     #include "platform.h"
@@ -23,6 +26,8 @@ extern "C" {
     #include "build/debug.h"
 
     #include "blackbox/blackbox.h"
+    #include "blackbox/blackbox_io.h"
+    #include "blackbox/blackbox_fielddefs.h"
     #include "common/utils.h"
 
     #include "pg/pg.h"
@@ -40,6 +45,11 @@ extern "C" {
 
     #include "fc/rc_controls.h"
     #include "fc/rc_modes.h"
+    #include "fc/runtime_config.h"
+
+#ifdef USE_SDCARD
+    #include "io/asyncfatfs/asyncfatfs.h"
+#endif
 
     #include "io/gps.h"
     #include "io/serial.h"
@@ -50,13 +60,286 @@ extern "C" {
     #include "sensors/gyro.h"
 
     extern int16_t blackboxIInterval;
-    extern int16_t blackboxPInterval;
+    extern int8_t blackboxPInterval;
+    extern pidProfile_t *currentPidProfile;
 }
 
 #include "unittest_macros.h"
 #include "gtest/gtest.h"
 
 gyroDev_t gyroDev;
+static uint32_t testMillis;
+
+#ifdef USE_SDCARD
+static std::vector<uint8_t> sdWritten;
+static uint32_t sdWriteLimit;
+static uint32_t sdLargestRequest;
+static unsigned sdWriteCalls;
+static unsigned sdCloseCalls;
+static bool sdFlushed;
+static bool sdCacheInSync;
+static bool sdFunctional;
+static bool sdFull;
+static bool sdDeferClose;
+static afatfsCallback_t sdCloseCallback;
+static const auto sdFile = reinterpret_cast<afatfsFilePtr_t>(1);
+static const auto sdDirectory = reinterpret_cast<afatfsFilePtr_t>(2);
+
+class BlackboxSdcardTest : public testing::Test {
+protected:
+    pidProfile_t profile = {};
+
+    void SetUp() override
+    {
+        blackboxConfigMutable()->device = BLACKBOX_DEVICE_SDCARD;
+        blackboxConfigMutable()->sample_rate = 0;
+        blackboxConfigMutable()->fields_disabled_mask = UINT32_MAX;
+        blackboxConfigMutable()->mode = BLACKBOX_MODE_NORMAL;
+        targetPidLooptime = 1000;
+        currentPidProfile = &profile;
+        armingFlags = 0;
+        testMillis = 0;
+        sdWriteLimit = 0;
+        sdLargestRequest = 0;
+        sdWriteCalls = 0;
+        sdCloseCalls = 0;
+        sdFlushed = true;
+        sdCacheInSync = true;
+        sdFunctional = true;
+        sdFull = false;
+        sdDeferClose = false;
+        sdCloseCallback = nullptr;
+        blackboxDeviceEndLog(false);
+        blackboxInit();
+        ASSERT_TRUE(blackboxDeviceOpen());
+        bool ready = false;
+        for (int i = 0; i < 10 && !ready; i++) {
+            ready = blackboxDeviceBeginLog();
+        }
+        ASSERT_TRUE(ready);
+        sdWritten.clear();
+        sdCloseCalls = 0;
+    }
+
+    void TearDown() override
+    {
+        blackboxDeviceEndLog(false);
+        blackboxConfigMutable()->device = BLACKBOX_DEVICE_NONE;
+        currentPidProfile = nullptr;
+        armingFlags = 0;
+    }
+
+    void drain()
+    {
+        for (unsigned i = 0; i < BLACKBOX_SDCARD_BUFFER_SIZE + 1; i++) {
+            if (blackboxDeviceReserveWriteBuffer(BLACKBOX_SDCARD_BUFFER_SIZE)) {
+                return;
+            }
+            blackboxDeviceFlush();
+        }
+        FAIL() << "SD FIFO failed to drain";
+    }
+
+    void startRecording()
+    {
+        sdWriteLimit = 512;
+        armingFlags = ARMED;
+        for (int i = 0; i < 1000; i++) {
+            testMillis++;
+            blackboxUpdate(testMillis * 1000);
+        }
+        drain();
+        sdWritten.clear();
+    }
+};
+
+TEST_F(BlackboxSdcardTest, RetriesZeroAndPartialWritesWithoutLosingBytes)
+{
+    std::vector<uint8_t> expected;
+    for (unsigned i = 0; i < 1200; i++) {
+        expected.push_back(i * 17);
+        blackboxWrite(expected.back());
+    }
+    for (int i = 0; i < 5; i++) {
+        blackboxDeviceFlush();
+    }
+    EXPECT_TRUE(sdWritten.empty());
+    EXPECT_EQ(5U, sdWriteCalls);
+    sdWriteLimit = 31;
+    drain();
+    EXPECT_EQ(expected, sdWritten);
+    EXPECT_LE(sdLargestRequest, 512U);
+}
+
+TEST_F(BlackboxSdcardTest, PreservesOrderAcrossRingWrap)
+{
+    std::vector<uint8_t> expected;
+    for (unsigned i = 0; i < BLACKBOX_SDCARD_BUFFER_SIZE - 100; i++) {
+        expected.push_back(i * 13);
+        blackboxWrite(expected.back());
+    }
+    sdWriteLimit = 512;
+    blackboxDeviceFlush();
+    blackboxDeviceFlush();
+    for (unsigned i = 0; i < 900; i++) {
+        expected.push_back(i * 11);
+        blackboxWrite(expected.back());
+    }
+    sdWriteLimit = 37;
+    drain();
+    EXPECT_EQ(expected, sdWritten);
+}
+
+TEST_F(BlackboxSdcardTest, HeaderBudgetTracksFifoAndNotFilesystemEstimate)
+{
+    const std::string text(BLACKBOX_SDCARD_BUFFER_SIZE - 9, 'x');
+    ASSERT_EQ(static_cast<int>(text.size()), blackboxWriteString(text.c_str()));
+    blackboxHeaderBudget = BLACKBOX_MAX_ACCUMULATED_HEADER_BUDGET;
+    blackboxReplenishHeaderBudget();
+    EXPECT_EQ(9, blackboxHeaderBudget);
+    EXPECT_EQ(BLACKBOX_RESERVE_TEMPORARY_FAILURE, blackboxDeviceReserveBufferSpace(10));
+    EXPECT_FALSE(blackboxDeviceReserveWriteBuffer(10));
+}
+
+TEST_F(BlackboxSdcardTest, ClosesOnlyAfterQueuedBytesAreAcceptedAndIsIdempotent)
+{
+    const std::string message(700, 'x');
+    blackboxWriteString(message.c_str());
+    EXPECT_FALSE(blackboxDeviceEndLog(true));
+    EXPECT_EQ(0U, sdCloseCalls);
+    sdWriteLimit = 400;
+    EXPECT_FALSE(blackboxDeviceEndLog(true));
+    EXPECT_EQ(0U, sdCloseCalls);
+    EXPECT_TRUE(blackboxDeviceEndLog(true));
+    EXPECT_EQ(1U, sdCloseCalls);
+    EXPECT_EQ(std::vector<uint8_t>(message.begin(), message.end()), sdWritten);
+    EXPECT_TRUE(blackboxDeviceEndLog(true));
+    EXPECT_EQ(1U, sdCloseCalls);
+}
+
+TEST_F(BlackboxSdcardTest, FlushCompleteWaitsForDeviceAndFilesystem)
+{
+    blackboxWriteString("pending");
+    EXPECT_FALSE(blackboxDeviceFlushForceComplete());
+    sdWriteLimit = 512;
+    sdFlushed = false;
+    EXPECT_FALSE(blackboxDeviceFlushForceComplete());
+    sdFlushed = true;
+    sdCacheInSync = false;
+    EXPECT_FALSE(blackboxDeviceFlushForceComplete());
+    sdCacheInSync = true;
+    EXPECT_TRUE(blackboxDeviceFlushForceComplete());
+}
+
+TEST_F(BlackboxSdcardTest, EndLogWaitsForAsynchronousCloseCallback)
+{
+    blackboxWriteString("tail");
+    sdWriteLimit = 512;
+    sdDeferClose = true;
+    EXPECT_FALSE(blackboxDeviceEndLog(true));
+    EXPECT_EQ(1U, sdCloseCalls);
+    EXPECT_FALSE(blackboxDeviceEndLog(true));
+    EXPECT_EQ(1U, sdCloseCalls);
+    EXPECT_FALSE(blackboxDeviceOpen());
+    ASSERT_NE(nullptr, sdCloseCallback);
+    sdCloseCallback();
+    sdCloseCallback = nullptr;
+    EXPECT_TRUE(blackboxDeviceEndLog(true));
+    EXPECT_EQ(1U, sdCloseCalls);
+}
+
+TEST_F(BlackboxSdcardTest, FullQueueSkipsWholeIterationThenResumesWithEventAndIFrame)
+{
+    startRecording();
+    sdWriteLimit = 0;
+    const std::string filler(BLACKBOX_SDCARD_BUFFER_SIZE, 'x');
+    ASSERT_EQ(static_cast<int>(filler.size()), blackboxWriteString(filler.c_str()));
+    for (int i = 0; i < 6000; i++) {
+        blackboxLogIteration(1000000U + i * 1000U);
+        blackboxAdvanceIterationTimers();
+    }
+    EXPECT_TRUE(sdWritten.empty());
+    sdWriteLimit = 512;
+    drain();
+    EXPECT_EQ(std::vector<uint8_t>(filler.begin(), filler.end()), sdWritten);
+    sdWritten.clear();
+
+    blackboxLogIteration(7000000);
+    drain();
+    ASSERT_GE(sdWritten.size(), 10U);
+    EXPECT_EQ('E', sdWritten[0]);
+    EXPECT_EQ(FLIGHT_LOG_EVENT_LOGGING_RESUME, sdWritten[1]);
+    size_t cursor = 2;
+    const auto readVarint = [&]() {
+        uint32_t value = 0;
+        for (unsigned shift = 0; cursor < sdWritten.size() && shift < 35; shift += 7) {
+            const uint8_t byte = sdWritten[cursor++];
+            value |= uint32_t(byte & 0x7f) << shift;
+            if (!(byte & 0x80)) break;
+        }
+        return value;
+    };
+    const uint32_t resumeIteration = readVarint();
+    EXPECT_EQ(7000000U, readVarint());
+    ASSERT_LT(cursor + 4, sdWritten.size());
+    EXPECT_EQ('S', sdWritten[cursor]);
+    cursor += 4; // all mocked slow-state values are zero
+    ASSERT_EQ('I', sdWritten[cursor++]);
+    EXPECT_EQ(resumeIteration, readVarint());
+    EXPECT_EQ(7000000U, readVarint());
+
+    blackboxAdvanceIterationTimers();
+    sdWritten.clear();
+    blackboxLogIteration(7001000);
+    drain();
+    ASSERT_FALSE(sdWritten.empty());
+    EXPECT_EQ(blackboxShouldLogIFrame() ? 'I' : 'P', sdWritten[0]);
+}
+
+TEST_F(BlackboxSdcardTest, StandaloneEventsAreNotPartiallyQueued)
+{
+    startRecording();
+    sdWriteLimit = 0;
+    const std::string filler(BLACKBOX_SDCARD_BUFFER_SIZE - 1, 'x');
+    blackboxWriteString(filler.c_str());
+    flightLogEventData_t event = {};
+    event.syncBeep.time = 123;
+    blackboxLogEvent(FLIGHT_LOG_EVENT_SYNC_BEEP, &event);
+    sdWriteLimit = 512;
+    drain();
+    EXPECT_EQ(std::vector<uint8_t>(filler.begin(), filler.end()), sdWritten);
+}
+
+TEST_F(BlackboxSdcardTest, FailedCardDoesNotHangShutdownWithQueuedBytes)
+{
+    startRecording();
+    sdWriteLimit = 0;
+    blackboxWriteString("pending");
+    blackboxFinish();
+    sdFunctional = false;
+    sdFlushed = false;
+    blackboxUpdate(2000000);
+    EXPECT_TRUE(blackboxMayEditConfig());
+    EXPECT_TRUE(blackboxDeviceReserveWriteBuffer(BLACKBOX_SDCARD_BUFFER_SIZE));
+    EXPECT_TRUE(sdWritten.empty());
+    EXPECT_FALSE(blackboxDeviceFlushForceComplete());
+}
+
+TEST_F(BlackboxSdcardTest, FullFilesystemDoesNotHangShutdownWithQueuedBytes)
+{
+    startRecording();
+    sdWriteLimit = 0;
+    blackboxWriteString("pending");
+    blackboxFinish();
+    sdFull = true;
+    sdFlushed = false;
+    blackboxUpdate(2000000);
+    EXPECT_TRUE(blackboxMayEditConfig());
+    EXPECT_TRUE(blackboxDeviceReserveWriteBuffer(BLACKBOX_SDCARD_BUFFER_SIZE));
+    EXPECT_TRUE(sdWritten.empty());
+    EXPECT_FALSE(blackboxDeviceFlushForceComplete());
+}
+#endif
 
 TEST(BlackboxTest, TestInitIntervals)
 {
@@ -369,7 +652,7 @@ uint8_t getMotorCount(void) {return 4;}
 bool areMotorsRunning(void) { return false; }
 bool IS_RC_MODE_ACTIVE(boxId_e) {return false;}
 bool isModeActivationConditionPresent(boxId_e) {return false;}
-uint32_t millis(void) {return 0;}
+uint32_t millis(void) {return testMillis;}
 bool sensors(uint32_t) {return false;}
 void serialWrite(serialPort_t *, uint8_t) {}
 uint32_t serialTxBytesFree(const serialPort_t *) {return 0;}
@@ -387,4 +670,42 @@ bool isRxReceivingSignal(void) {return false;}
 bool isRssiConfigured(void) {return false;}
 float getMotorOutputLow(void) {return 0.0;}
 float getMotorOutputHigh(void) {return 0.0;}
+
+#ifdef USE_SDCARD
+bool afatfs_mkdir(const char *, afatfsFileCallback_t complete) { complete(sdDirectory); return true; }
+void afatfs_findFirst(afatfsFilePtr_t, afatfsFinder_t *) {}
+void afatfs_findLast(afatfsFilePtr_t) {}
+afatfsOperationStatus_e afatfs_findNext(afatfsFilePtr_t, afatfsFinder_t *, fatDirectoryEntry_t **entry) {
+    *entry = nullptr;
+    return AFATFS_OPERATION_SUCCESS;
+}
+bool fat_isDirectoryEntryTerminator(fatDirectoryEntry_t *) { return true; }
+bool afatfs_chdir(afatfsFilePtr_t) { return true; }
+bool afatfs_fopen(const char *, const char *, afatfsFileCallback_t complete) { complete(sdFile); return true; }
+bool afatfs_fclose(afatfsFilePtr_t file, afatfsCallback_t callback) {
+    EXPECT_NE(nullptr, file);
+    if (file == sdFile) sdCloseCalls++;
+    if (callback) {
+        if (sdDeferClose) sdCloseCallback = callback;
+        else callback();
+    }
+    return true;
+}
+bool afatfs_funlink(afatfsFilePtr_t, afatfsCallback_t callback) { if (callback) callback(); return true; }
+uint32_t afatfs_fwrite(afatfsFilePtr_t file, const uint8_t *buffer, uint32_t len) {
+    EXPECT_EQ(sdFile, file);
+    sdWriteCalls++;
+    sdLargestRequest = std::max(sdLargestRequest, len);
+    const uint32_t accepted = std::min(sdWriteLimit, len);
+    sdWritten.insert(sdWritten.end(), buffer, buffer + accepted);
+    return accepted;
+}
+afatfsFilesystemState_e afatfs_getFilesystemState(void) { return AFATFS_FILESYSTEM_STATE_READY; }
+bool afatfs_isFull(void) { return sdFull; }
+uint32_t afatfs_getFreeBufferSpace(void) { return 4096; }
+bool afatfs_flush(void) { return sdFlushed; }
+bool afatfs_sectorCacheInSync(void) { return sdCacheInSync; }
+bool sdcard_isInserted(void) { return true; }
+bool sdcard_isFunctional(void) { return sdFunctional; }
+#endif
 }

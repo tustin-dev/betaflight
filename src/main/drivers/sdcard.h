@@ -65,6 +65,9 @@ bool sdcard_readBlock(uint32_t blockIndex, uint8_t *buffer, sdcard_operationComp
 sdcardOperationStatus_e sdcard_beginWriteBlocks(uint32_t blockIndex, uint32_t blockCount);
 sdcardOperationStatus_e sdcard_writeBlock(uint32_t blockIndex, uint8_t *buffer, sdcard_operationCompleteCallback_c callback, uint32_t callbackData);
 
+// Request that driver-owned write buffers reach the card. Retry until complete.
+bool sdcard_flush(void);
+
 bool sdcard_isInserted(void);
 bool sdcard_isInitialized(void);
 bool sdcard_isFunctional(void);

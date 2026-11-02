@@ -151,6 +151,15 @@ sdcardOperationStatus_e sdcard_writeBlock(uint32_t blockIndex, uint8_t *buffer, 
     return sdcardVTable->sdcard_writeBlock(blockIndex, buffer, callback, callbackData);
 }
 
+bool sdcard_flush(void)
+{
+    if (!sdcardVTable) {
+        return false;
+    }
+    // SPI has no additional write-back cache; preserve its existing behaviour.
+    return !sdcardVTable->sdcard_flush || sdcardVTable->sdcard_flush();
+}
+
 bool sdcard_poll(void)
 {
     // sdcard_poll is called from taskMain() via afatfs_poll() and  for USE_SDCARD.

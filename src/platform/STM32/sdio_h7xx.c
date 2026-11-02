@@ -49,6 +49,9 @@ typedef struct SD_Handle_s
     volatile uint32_t RXCplt;          // SD RX Complete is equal 0 when no transfer
     volatile uint32_t TXCplt;          // SD TX Complete is equal 0 when no transfer
 
+    volatile bool RXFailed;
+    volatile bool TXFailed;
+
     uint32_t RXErrors;
     uint32_t TXErrors;
 } SD_Handle_t;
@@ -550,12 +553,14 @@ SD_Error_t SD_Init(void)
 
 SD_Error_t SD_CheckWrite(void)
 {
+    if (SD_Handle.TXFailed) return SD_ERROR;
     if (SD_Handle.TXCplt != 0) return SD_BUSY;
     return SD_OK;
 }
 
 SD_Error_t SD_CheckRead(void)
 {
+    if (SD_Handle.RXFailed) return SD_ERROR;
     if (SD_Handle.RXCplt != 0) return SD_BUSY;
     return SD_OK;
 }
@@ -563,7 +568,6 @@ SD_Error_t SD_CheckRead(void)
 SD_Error_t SD_WriteBlocks_DMA(uint64_t WriteAddress, uint32_t *buffer, uint32_t BlockSize, uint32_t NumberOfBlocks)
 {
     SD_Error_t ErrorState = SD_OK;
-    SD_Handle.TXCplt = 1;
 
     if (BlockSize != 512) {
         return SD_ERROR; // unsupported.
@@ -576,8 +580,12 @@ SD_Error_t SD_WriteBlocks_DMA(uint64_t WriteAddress, uint32_t *buffer, uint32_t 
     // Ensure the data is flushed to main memory
     SCB_CleanDCache_by_Addr(buffer, NumberOfBlocks * BlockSize);
 
+    SD_Handle.TXFailed = false;
+    SD_Handle.TXCplt = 1;
     HAL_StatusTypeDef status;
     if ((status = HAL_SD_WriteBlocks_DMA(&hsd1, (uint8_t *)buffer, WriteAddress, NumberOfBlocks)) != HAL_OK) {
+        SD_Handle.TXFailed = true;
+        SD_Handle.TXCplt = 0;
         return SD_ERROR;
     }
 
@@ -604,6 +612,7 @@ SD_Error_t SD_ReadBlocks_DMA(uint64_t ReadAddress, uint32_t *buffer, uint32_t Bl
         return SD_ADDR_MISALIGNED;
     }
 
+    SD_Handle.RXFailed = false;
     SD_Handle.RXCplt = 1;
 
     sdReadParameters.buffer = buffer;
@@ -612,6 +621,8 @@ SD_Error_t SD_ReadBlocks_DMA(uint64_t ReadAddress, uint32_t *buffer, uint32_t Bl
 
     HAL_StatusTypeDef status;
     if ((status = HAL_SD_ReadBlocks_DMA(&hsd1, (uint8_t *)buffer, ReadAddress, NumberOfBlocks)) != HAL_OK) {
+        SD_Handle.RXFailed = true;
+        SD_Handle.RXCplt = 0;
         return SD_ERROR;
     }
 
@@ -652,6 +663,10 @@ void HAL_SD_RxCpltCallback(SD_HandleTypeDef *hsd)
 void HAL_SD_ErrorCallback(SD_HandleTypeDef *hsd)
 {
     UNUSED(hsd);
+    // An error can arrive after the DMA-complete callback but before the card
+    // finishes programming. Keep it visible until the next transfer starts.
+    SD_Handle.RXFailed = true;
+    SD_Handle.TXFailed = true;
     if (SD_Handle.RXCplt) {
         SD_Handle.RXErrors++;
         SD_Handle.RXCplt = 0;
@@ -667,6 +682,8 @@ void HAL_SD_AbortCallback(SD_HandleTypeDef *hsd)
 {
     UNUSED(hsd);
 
+    SD_Handle.TXFailed = true;
+    SD_Handle.RXFailed = true;
     SD_Handle.TXCplt = 0;
     SD_Handle.RXCplt = 0;
 }

@@ -82,6 +82,7 @@ void afatfs_findFirst(afatfsFilePtr_t directory, afatfsFinder_t *finder);
 afatfsOperationStatus_e afatfs_findNext(afatfsFilePtr_t directory, afatfsFinder_t *finder, fatDirectoryEntry_t **dirEntry);
 void afatfs_findLast(afatfsFilePtr_t directory);
 
+// Queue dirty sectors and flush driver-owned buffers; retry until complete.
 bool afatfs_flush(void);
 void afatfs_init(void);
 bool afatfs_destroy(bool dirty);

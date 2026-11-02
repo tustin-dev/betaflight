@@ -74,9 +74,18 @@ static portSharing_e blackboxPortSharing;
 
 #ifdef USE_SDCARD
 
+// Keep disk backpressure out of the PID loop. Partial filesystem writes leave
+// their unwritten suffix in this FIFO for the next non-blocking flush.
+STATIC_ASSERT(BLACKBOX_SDCARD_BUFFER_SIZE > 1024, blackbox_sdcard_buffer_too_small);
+static uint8_t blackboxSDCardBuffer[BLACKBOX_SDCARD_BUFFER_SIZE];
+static uint32_t blackboxSDCardBufferHead;
+static uint32_t blackboxSDCardBufferTail;
+static uint32_t blackboxSDCardBufferUsed;
+
 static struct {
     afatfsFilePtr_t logFile;
     afatfsFilePtr_t logDirectory;
+    bool closePending;
     afatfsFinder_t logDirectoryFinder;
     int32_t largestLogFileNumber;
 
@@ -93,7 +102,46 @@ static struct {
 #define LOGFILE_PREFIX "LOG"
 #define LOGFILE_SUFFIX "BFL"
 
+static uint32_t blackboxSDCardBufferFree(void)
+{
+    return sizeof(blackboxSDCardBuffer) - blackboxSDCardBufferUsed;
+}
+
+static void blackboxSDCardBufferReset(void)
+{
+    blackboxSDCardBufferHead = 0;
+    blackboxSDCardBufferTail = 0;
+    blackboxSDCardBufferUsed = 0;
+}
+
+static bool blackboxSDCardFlush(void)
+{
+    if (blackboxSDCardBufferUsed && blackboxSDCard.logFile) {
+        // At most one sector-sized memcpy/allocation attempt per call, never
+        // wait for the SD card or spin when the filesystem accepts no bytes.
+        const uint32_t count = MIN(512U, MIN(blackboxSDCardBufferUsed,
+            (uint32_t)sizeof(blackboxSDCardBuffer) - blackboxSDCardBufferTail));
+        const uint32_t written = afatfs_fwrite(blackboxSDCard.logFile,
+            blackboxSDCardBuffer + blackboxSDCardBufferTail, count);
+        blackboxSDCardBufferTail = (blackboxSDCardBufferTail + written) % sizeof(blackboxSDCardBuffer);
+        blackboxSDCardBufferUsed -= written;
+    }
+    return blackboxSDCardBufferUsed == 0;
+}
+
 #endif // USE_SDCARD
+
+bool blackboxDeviceReserveWriteBuffer(uint32_t bytes)
+{
+#ifdef USE_SDCARD
+    if (blackboxConfig()->device == BLACKBOX_DEVICE_SDCARD) {
+        return bytes <= blackboxSDCardBufferFree();
+    }
+#else
+    UNUSED(bytes);
+#endif
+    return true;
+}
 
 void blackboxOpen(void)
 {
@@ -124,7 +172,12 @@ void blackboxWrite(uint8_t value)
 #endif
 #ifdef USE_SDCARD
     case BLACKBOX_DEVICE_SDCARD:
-        afatfs_fputc(blackboxSDCard.logFile, value);
+        // Record producers reserve the complete encoded record before writing.
+        if (blackboxSDCardBufferUsed < sizeof(blackboxSDCardBuffer)) {
+            blackboxSDCardBuffer[blackboxSDCardBufferHead] = value;
+            blackboxSDCardBufferHead = (blackboxSDCardBufferHead + 1) % sizeof(blackboxSDCardBuffer);
+            blackboxSDCardBufferUsed++;
+        }
         break;
 #endif
 #ifdef USE_BLACKBOX_VIRTUAL
@@ -188,7 +241,12 @@ int blackboxWriteString(const char *s)
 #ifdef USE_SDCARD
     case BLACKBOX_DEVICE_SDCARD:
         length = strlen(s);
-        afatfs_fwrite(blackboxSDCard.logFile, (const uint8_t*) s, length); // Ignore failures due to buffers filling up
+        if ((uint32_t)length > blackboxSDCardBufferFree()) {
+            return 0;
+        }
+        for (int i = 0; i < length; i++) {
+            blackboxWrite((uint8_t)s[i]);
+        }
         break;
 #endif // USE_SDCARD
 
@@ -222,6 +280,11 @@ int blackboxWriteString(const char *s)
 void blackboxDeviceFlush(void)
 {
     switch (blackboxConfig()->device) {
+#ifdef USE_SDCARD
+    case BLACKBOX_DEVICE_SDCARD:
+        blackboxSDCardFlush();
+        break;
+#endif
 #ifdef USE_FLASHFS
         /*
          * This is our only output device which requires us to call flush() in order for it to write anything. The other
@@ -261,12 +324,11 @@ bool blackboxDeviceFlushForce(void)
 
 #ifdef USE_SDCARD
     case BLACKBOX_DEVICE_SDCARD:
-        // SD card will flush itself without us calling it, but we need to call flush manually in order to check
-        // if it's done yet or not!
-        // However the "flush" only queues one dirty sector each time and the process is asynchronous. So after
-        // the last dirty sector is queued the flush returns true even though the sector may not actually have
-        // been physically written to the SD card yet.
-        return afatfs_flush();
+        {
+            const bool fifoEmpty = blackboxSDCardFlush();
+            const bool flushed = afatfs_flush();
+            return fifoEmpty && flushed;
+        }
 #endif // USE_SDCARD
 #ifdef USE_BLACKBOX_VIRTUAL
     case BLACKBOX_DEVICE_VIRTUAL:
@@ -285,12 +347,7 @@ bool blackboxDeviceFlushForceComplete(void)
     switch (blackboxConfig()->device) {
 #ifdef USE_SDCARD
     case BLACKBOX_DEVICE_SDCARD:
-        if (afatfs_sectorCacheInSync()) {
-            return true;
-        } else {
-            blackboxDeviceFlushForce();
-            return false;
-        }
+        return blackboxDeviceFlushForce() && afatfs_sectorCacheInSync();
 #endif // USE_SDCARD
 #ifdef USE_BLACKBOX_VIRTUAL
     case BLACKBOX_DEVICE_VIRTUAL:
@@ -379,7 +436,7 @@ bool blackboxDeviceOpen(void)
 #endif // USE_FLASHFS
 #ifdef USE_SDCARD
     case BLACKBOX_DEVICE_SDCARD:
-        if (afatfs_getFilesystemState() == AFATFS_FILESYSTEM_STATE_FATAL || afatfs_getFilesystemState() == AFATFS_FILESYSTEM_STATE_UNKNOWN || afatfs_isFull()) {
+        if (blackboxSDCard.closePending || !sdcard_isFunctional() || afatfs_getFilesystemState() == AFATFS_FILESYSTEM_STATE_FATAL || afatfs_getFilesystemState() == AFATFS_FILESYSTEM_STATE_UNKNOWN || afatfs_isFull()) {
             return false;
         }
 
@@ -442,6 +499,18 @@ bool isBlackboxErased(void)
 void blackboxDeviceClose(void)
 {
     switch (blackboxConfig()->device) {
+#ifdef USE_SDCARD
+    case BLACKBOX_DEVICE_SDCARD:
+        // Normal shutdown has already drained and closed the file. On media
+        // failure/full, abandon the unwritable suffix and attempt to close;
+        // do not report it as successfully flushed or reuse a closing handle.
+        blackboxSDCardBufferReset();
+        if (blackboxSDCard.logFile && !blackboxDeviceEndLog(true) && !blackboxSDCard.closePending) {
+            blackboxSDCard.logFile = NULL;
+            blackboxSDCard.state = BLACKBOX_SDCARD_INITIAL;
+        }
+        break;
+#endif
     case BLACKBOX_DEVICE_SERIAL:
         // Can immediately close without attempting to flush any remaining data.
         // Since the serial port could be shared with other processes, we have to give it back here
@@ -491,6 +560,8 @@ static void blackboxLogDirCreated(afatfsFilePtr_t directory)
 static void blackboxLogFileCreated(afatfsFilePtr_t file)
 {
     if (file) {
+        blackboxSDCardBufferReset();
+        blackboxSDCard.closePending = false;
         blackboxSDCard.logFile = file;
 
         blackboxSDCard.largestLogFileNumber++;
@@ -588,6 +659,13 @@ static bool blackboxSDCardBeginLog(void)
     return false;
 }
 
+static void blackboxLogFileClosed(void)
+{
+    blackboxSDCard.closePending = false;
+    blackboxSDCard.logFile = NULL;
+    blackboxSDCard.state = BLACKBOX_SDCARD_READY_TO_CREATE_LOG;
+}
+
 #endif // USE_SDCARD
 
 /**
@@ -628,16 +706,29 @@ bool blackboxDeviceEndLog(bool retainLog)
     switch (blackboxConfig()->device) {
 #ifdef USE_SDCARD
     case BLACKBOX_DEVICE_SDCARD:
-        // Keep retrying until the close operation queues
-        if (
-            (retainLog && afatfs_fclose(blackboxSDCard.logFile, NULL))
-            || (!retainLog && afatfs_funlink(blackboxSDCard.logFile, NULL))
-        ) {
-            // Don't bother waiting the for the close to complete, it's queued now and will complete eventually
-            blackboxSDCard.logFile = NULL;
-            blackboxSDCard.state = BLACKBOX_SDCARD_READY_TO_CREATE_LOG;
+        if (blackboxSDCard.closePending) {
+            return false;
+        }
+        if (!blackboxSDCard.logFile) {
             return true;
         }
+        if (retainLog) {
+            if (!blackboxSDCardFlush()) {
+                return false;
+            }
+        } else {
+            blackboxSDCardBufferReset();
+        }
+        // Wait for the filesystem close callback: accepting the request alone
+        // does not release locked file data or finish updating its directory.
+        blackboxSDCard.closePending = true;
+        if (
+            (retainLog && afatfs_fclose(blackboxSDCard.logFile, blackboxLogFileClosed))
+            || (!retainLog && afatfs_funlink(blackboxSDCard.logFile, blackboxLogFileClosed))
+        ) {
+            return !blackboxSDCard.closePending;
+        }
+        blackboxSDCard.closePending = false;
         return false;
 #endif // USE_SDCARD
 
@@ -737,7 +828,8 @@ void blackboxReplenishHeaderBudget(void)
 #endif
 #ifdef USE_SDCARD
     case BLACKBOX_DEVICE_SDCARD:
-        freeSpace = afatfs_getFreeBufferSpace();
+        blackboxSDCardFlush();
+        freeSpace = blackboxSDCardBufferFree();
         break;
 #endif
 #ifdef USE_BLACKBOX_VIRTUAL

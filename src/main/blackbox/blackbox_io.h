@@ -38,11 +38,20 @@ typedef enum {
  */
 #define BLACKBOX_TARGET_HEADER_BUDGET_PER_ITERATION 64
 
+#ifdef USE_SDCARD
+#ifndef BLACKBOX_SDCARD_BUFFER_SIZE
+#define BLACKBOX_SDCARD_BUFFER_SIZE 2048
+#endif
+#endif
+
 extern int32_t blackboxHeaderBudget;
 
 void blackboxOpen(void);
 void blackboxWrite(uint8_t value);
 int blackboxWriteString(const char *s);
+
+// Reserve enough staging space for a complete record/iteration before encoding it.
+bool blackboxDeviceReserveWriteBuffer(uint32_t bytes);
 
 void blackboxDeviceFlush(void);
 bool blackboxDeviceFlushForce(void);

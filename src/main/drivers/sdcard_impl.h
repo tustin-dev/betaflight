@@ -121,6 +121,7 @@ typedef struct sdcardVTable_s {
 #ifdef SDCARD_PROFILING
     void (*sdcardSdio_setProfilerCallback)(sdcard_profilerCallback_c callback);
 #endif
+    bool (*sdcard_flush)(void);
 } sdcardVTable_t;
 
 #ifdef USE_SDCARD_SPI

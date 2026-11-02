@@ -38,6 +38,9 @@
 #ifndef SDIO_USE_4BIT
 #define SDIO_USE_4BIT false
 #endif
+#ifndef SDIO_USE_CACHE
+#define SDIO_USE_CACHE false
+#endif
 #ifndef SDIO_CK_PIN
 #define SDIO_CK_PIN NONE
 #endif
@@ -61,7 +64,7 @@ PG_REGISTER_WITH_RESET_TEMPLATE(sdioConfig_t, sdioConfig, PG_SDIO_CONFIG, 0);
 
 PG_RESET_TEMPLATE(sdioConfig_t, sdioConfig,
     .clockBypass = 0,
-    .useCache = 0,
+    .useCache = SDIO_USE_CACHE,
     .use4BitWidth = SDIO_USE_4BIT,
     .dmaopt = SDCARD_SDIO_DMA_OPT,
     .device = SDIO_DEV_TO_CFG(SDIO_DEVICE),

@@ -117,6 +117,7 @@ PG_RESET_TEMPLATE(blackboxConfig_t, blackboxConfig,
 STATIC_ASSERT((sizeof(blackboxConfig()->fields_disabled_mask) * 8) >= FLIGHT_LOG_FIELD_SELECT_COUNT, too_many_flight_log_fields_selections);
 
 #define BLACKBOX_SHUTDOWN_TIMEOUT_MILLIS 200
+#define BLACKBOX_EVENT_BUFFER_RESERVE 32
 
 // Some macros to make writing FLIGHT_LOG_FIELD_* constants shorter:
 
@@ -446,6 +447,7 @@ STATIC_UNIT_TESTED int8_t blackboxPInterval = 0;
 STATIC_UNIT_TESTED int32_t blackboxSInterval = 0;
 STATIC_UNIT_TESTED int32_t blackboxSlowFrameIterationTimer;
 static bool blackboxLoggedAnyFrames;
+static bool blackboxNeedsIFrame;
 static float blackboxHighResolutionScale;
 
 /*
@@ -1082,6 +1084,7 @@ static void blackboxResetIterationTimers(void)
  */
 static void blackboxStart(void)
 {
+    blackboxNeedsIFrame = false;
     blackboxValidateConfig();
 
     if (!blackboxDeviceOpen()) {
@@ -1247,10 +1250,10 @@ static void writeGPSFrame(timeUs_t currentTimeUs)
  */
 static void loadMainState(timeUs_t currentTimeUs)
 {
-#ifndef UNIT_TEST
     blackboxMainState_t *blackboxCurrent = blackboxHistory[0];
 
     blackboxCurrent->time = currentTimeUs;
+#ifndef UNIT_TEST
     for (int i = 0; i < XYZ_AXIS_COUNT; i++) {
         blackboxCurrent->axisPID_P[i] = lrintf(pidData[i].P);
         blackboxCurrent->axisPID_I[i] = lrintf(pidData[i].I);
@@ -1485,7 +1488,9 @@ static bool blackboxWriteSysinfo(void)
     const uint16_t motorOutputHighInt = lrintf(getMotorOutputHigh());
 
     // Make sure we have enough room in the buffer for our longest line (as of this writing, the "Firmware date" line)
-    if (blackboxDeviceReserveBufferSpace(64) != BLACKBOX_RESERVE_SUCCESS) {
+    const int32_t sysinfoReserve = blackboxConfig()->device == BLACKBOX_DEVICE_SDCARD
+        ? BLACKBOX_MAX_ACCUMULATED_HEADER_BUDGET : 64;
+    if (blackboxDeviceReserveBufferSpace(sysinfoReserve) != BLACKBOX_RESERVE_SUCCESS) {
         return false;
     }
 
@@ -1873,6 +1878,10 @@ static bool blackboxWriteSysinfo(void)
     }
 
     xmitState.headerIndex++;
+#else
+    // Unit tests omit the build-specific sysinfo strings, but still exercise
+    // the real header-to-running and shutdown state transitions.
+    return true;
 #endif // UNIT_TEST
     return false;
 }
@@ -1884,6 +1893,14 @@ void blackboxLogEvent(FlightLogEvent event, flightLogEventData_t *data)
 {
     // Only allow events to be logged after headers have been written
     if (!(blackboxState == BLACKBOX_STATE_RUNNING || blackboxState == BLACKBOX_STATE_PAUSED)) {
+        return;
+    }
+
+    // Events can also be emitted outside blackboxLogIteration(). The largest
+    // event fits in 32 bytes; either retain the complete event or omit it.
+    const uint32_t eventReserve = event == FLIGHT_LOG_EVENT_LOG_END
+        ? BLACKBOX_EVENT_BUFFER_RESERVE : 2 * BLACKBOX_EVENT_BUFFER_RESERVE;
+    if (!blackboxDeviceReserveWriteBuffer(eventReserve)) {
         return;
     }
 
@@ -1998,6 +2015,38 @@ STATIC_UNIT_TESTED void blackboxAdvanceIterationTimers(void)
 // Called once every FC loop in order to log the current state
 STATIC_UNIT_TESTED void blackboxLogIteration(timeUs_t currentTimeUs)
 {
+#ifdef USE_SDCARD
+    STATIC_ASSERT(2 * sizeof(blackboxMainState_t) + 256 + BLACKBOX_EVENT_BUFFER_RESERVE <= BLACKBOX_SDCARD_BUFFER_SIZE, blackbox_iteration_exceeds_sdcard_buffer);
+#endif
+    // A variable-byte field uses at most twice its in-memory storage here;
+    // allow another 256 bytes for slow/GPS/home frames and event records.
+    // This reservation is against our FIFO, not the filesystem's optimistic
+    // free-sector estimate, and does not wait for the SD card.
+    if (!blackboxDeviceReserveWriteBuffer(2 * sizeof(blackboxMainState_t) + 256 + BLACKBOX_EVENT_BUFFER_RESERVE)) {
+        blackboxNeedsIFrame = true;
+        return;
+    }
+
+    if (blackboxNeedsIFrame) {
+        if (!blackboxShouldLogIFrame() && !blackboxShouldLogPFrame()) {
+            return;
+        }
+        // P frames have implicit iteration numbers and two-frame predictors.
+        // Resume with an absolute iteration/time and fresh predictor history.
+        flightLogEvent_loggingResume_t resume = {
+            .logIteration = blackboxIteration,
+            .currentTime = currentTimeUs,
+        };
+        blackboxLogEvent(FLIGHT_LOG_EVENT_LOGGING_RESUME, (flightLogEventData_t *)&resume);
+        blackboxSlowFrameIterationTimer = blackboxSInterval;
+        writeSlowFrameIfNeeded();
+        loadMainState(currentTimeUs);
+        writeIntraframe();
+        blackboxNeedsIFrame = false;
+        blackboxDeviceFlush();
+        return;
+    }
+
     // Write a keyframe every blackboxIInterval frames so we can resynchronise upon missing frames
     if (blackboxShouldLogIFrame()) {
         /*
@@ -2049,6 +2098,21 @@ STATIC_UNIT_TESTED void blackboxLogIteration(timeUs_t currentTimeUs)
 void blackboxUpdate(timeUs_t currentTimeUs)
 {
     static blackboxState_e cacheFlushNextState;
+
+#ifdef USE_SDCARD
+    // Also make progress during header generation, pauses, and shutdown.
+    if (blackboxConfig()->device == BLACKBOX_DEVICE_SDCARD) {
+        if (blackboxState >= BLACKBOX_STATE_SEND_HEADER && blackboxState <= BLACKBOX_STATE_SHUTTING_DOWN
+            && (!isBlackboxDeviceWorking() || isBlackboxDeviceFull())) {
+            // A failed/full medium cannot drain queued data. Stop this log
+            // without waiting forever or claiming that its tail reached disk.
+            blackboxDeviceClose();
+            blackboxSetState(BLACKBOX_STATE_STOPPED);
+            return;
+        }
+        blackboxDeviceFlush();
+    }
+#endif
 
     switch (blackboxState) {
     case BLACKBOX_STATE_STOPPED:
@@ -2183,7 +2247,10 @@ void blackboxUpdate(timeUs_t currentTimeUs)
          *
          * Don't wait longer than it could possibly take if something funky happens.
          */
-        if (blackboxDeviceEndLog(blackboxLoggedAnyFrames) && (millis() > xmitState.u.startTime + BLACKBOX_SHUTDOWN_TIMEOUT_MILLIS || blackboxDeviceFlushForce())) {
+        if (blackboxDeviceEndLog(blackboxLoggedAnyFrames)
+            && (blackboxDeviceFlushForceComplete()
+                || (blackboxConfig()->device != BLACKBOX_DEVICE_SDCARD
+                    && millis() > xmitState.u.startTime + BLACKBOX_SHUTDOWN_TIMEOUT_MILLIS))) {
             blackboxDeviceClose();
             blackboxSetState(BLACKBOX_STATE_STOPPED);
         }
@@ -2281,6 +2348,7 @@ uint8_t blackboxCalculateSampleRate(uint16_t pRatio)
 void blackboxInit(void)
 {
     blackboxResetIterationTimers();
+    blackboxNeedsIFrame = false;
 
     // an I-frame is written every 32ms
     // blackboxUpdate() is run in synchronisation with the PID loop
