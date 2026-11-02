@@ -56,6 +56,7 @@ const char * const lookupTableGyroHardware[GYRO_HARDWARE_COUNT] = {
     [GYRO_ICM42688P] = "ICM42688P",
     [GYRO_BMI160] = "BMI160",
     [GYRO_BMI270] = "BMI270",
+    [GYRO_BMI088] = "BMI088",
     [GYRO_LSM6DSO] = "LSM6DSO",
     [GYRO_LSM6DSV16X] = "LSM6DSV16X",
     [GYRO_IIM42653] = "IIM42653",
@@ -87,6 +88,7 @@ const char * const lookupTableAccHardware[ACC_HARDWARE_COUNT] = {
     [ACC_ICM42688P] = "ICM42688P",
     [ACC_BMI160] = "BMI160",
     [ACC_BMI270] = "BMI270",
+    [ACC_BMI088] = "BMI088",
     [ACC_LSM6DSO] = "LSM6DSO",
     [ACC_LSM6DSV16X] = "LSM6DSV16X",
     [ACC_IIM42653] = "IIM42653",
@@ -117,7 +119,8 @@ const char * const lookupTableBaroHardware[BARO_HARDWARE_COUNT] = {
     [BARO_BMP580] = "BMP580",
     [BARO_BMP581] = "BMP581",
     [BARO_VIRTUAL] = "VIRTUAL",
-    [BARO_SPA06_003] = "SPA06_003"
+    [BARO_SPA06_003] = "SPA06_003",
+    [BARO_ICP20100] = "ICP20100"
 };
 
 // sync with magSensor_e

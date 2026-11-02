@@ -315,6 +315,7 @@ COMMON_SRC += \
             drivers/accgyro/accgyro_mpu.c \
             drivers/accgyro/accgyro_spi_bmi160.c \
             drivers/accgyro/accgyro_spi_bmi270.c \
+            drivers/accgyro/accgyro_spi_bmi088.c \
             drivers/accgyro/accgyro_spi_icm20649.c \
             drivers/accgyro/accgyro_spi_icm20689.c \
             drivers/accgyro/accgyro_spi_icm40609.c \
@@ -336,6 +337,7 @@ COMMON_SRC += \
             drivers/barometer/barometer_bmp388.c \
             drivers/barometer/barometer_bmp5xx.c \
             drivers/barometer/barometer_dps310.c \
+            drivers/barometer/barometer_icp20100.c \
             drivers/barometer/barometer_lps22df.c \
             drivers/barometer/barometer_lps.c \
             drivers/barometer/barometer_ms5611.c \
@@ -380,6 +382,7 @@ RX_SRC = \
 
 FLASH_SRC += \
             drivers/flash/flash.c \
+            drivers/flash/flash_fm25v02a.c \
             drivers/flash/flash_m25p16.c \
             drivers/flash/flash_mt29f.c \
             drivers/flash/flash_mx66uw1g45g.c \
@@ -411,6 +414,7 @@ SIZE_OPTIMISED_SRC += \
             drivers/accgyro/accgyro_spi_lsm6dso_init.c \
             drivers/barometer/barometer_bmp085.c \
             drivers/barometer/barometer_bmp280.c \
+            drivers/barometer/barometer_icp20100.c \
             drivers/barometer/barometer_ms5611.c \
             drivers/barometer/barometer_lps.c \
             drivers/barometer/barometer_qmp6988.c \
@@ -434,6 +438,7 @@ SPEED_OPTIMISED_SRC += \
             drivers/accgyro/accgyro_mpu.c \
             drivers/accgyro/accgyro_spi_bmi160.c \
             drivers/accgyro/accgyro_spi_bmi270.c \
+            drivers/accgyro/accgyro_spi_bmi088.c \
             drivers/accgyro/accgyro_spi_lsm6dso.c
 
 endif

@@ -79,6 +79,16 @@ compass_ist8310_unittest_SRC := \
 compass_ist8310_unittest_DEFINES := \
                 USE_MAG_IST8310=
 
+flash_fm25v02a_unittest_SRC := \
+		$(USER_DIR)/drivers/flash/flash_fm25v02a.c \
+		$(USER_DIR)/drivers/flash/flash.c
+
+flash_fm25v02a_unittest_DEFINES := \
+		USE_FLASH_CHIP= \
+		USE_FLASH_SPI= \
+		USE_FLASH_M25P16= \
+		USE_FLASH_FM25V02A=
+
 baro_bmp085_unittest_SRC := \
 		$(USER_DIR)/drivers/barometer/barometer_bmp085.c
 
@@ -101,6 +111,12 @@ baro_bmp388_unittest_DEFINES := \
                 USE_BARO_BMP388= \
                 USE_BARO_SPI_BMP388=
 
+baro_icp20100_unittest_SRC := \
+		$(USER_DIR)/drivers/barometer/barometer_icp20100.c
+
+baro_icp20100_unittest_DEFINES := \
+		USE_BARO_ICP20100=
+
 baro_ms5611_unittest_SRC := \
 		$(USER_DIR)/drivers/barometer/barometer_ms5611.c
 
@@ -118,6 +134,14 @@ accgyro_spi_icm426xx_unittest_DEFINES := \
                 USE_GYRO_SPI_ICM42688P= \
                 USE_ACCGYRO_IIM42652= \
                 USE_ACCGYRO_IIM42653=
+
+accgyro_spi_bmi088_unittest_SRC := \
+		$(USER_DIR)/drivers/accgyro/accgyro_spi_bmi088.c \
+		$(USER_DIR)/drivers/accgyro/gyro_sync.c
+
+accgyro_spi_bmi088_unittest_DEFINES := \
+		USE_ACCGYRO_BMI088= \
+		SPI_IO_CS_CFG=0
 
 # This test is disabled due to build errors.
 # Its source code is archived in unit/battery_unittest.cc.txt

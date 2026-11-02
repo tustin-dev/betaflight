@@ -134,6 +134,7 @@
     && !defined(USE_ACC_MPU6500) \
     && !defined(USE_ACCGYRO_BMI160) \
     && !defined(USE_ACCGYRO_BMI270) \
+    && !defined(USE_ACCGYRO_BMI088) \
     && !defined(USE_ACC_SPI_ICM20602) \
     && !defined(USE_ACC_SPI_ICM20649) \
     && !defined(USE_ACC_SPI_ICM20689) \
@@ -162,6 +163,7 @@
     && !defined(USE_GYRO_MPU6500) \
     && !defined(USE_ACCGYRO_BMI160) \
     && !defined(USE_ACCGYRO_BMI270) \
+    && !defined(USE_ACCGYRO_BMI088) \
     && !defined(USE_GYRO_SPI_ICM20602) \
     && !defined(USE_GYRO_SPI_ICM20649) \
     && !defined(USE_GYRO_SPI_ICM20689) \
@@ -325,6 +327,9 @@
 #endif
 #if defined(USE_BARO_MS5611)
 #undef USE_BARO_MS5611
+#endif
+#if defined(USE_BARO_ICP20100)
+#undef USE_BARO_ICP20100
 #endif
 #endif
 
@@ -500,13 +505,13 @@
 #define USE_FLASH_W25M
 #endif
 
-#if defined(USE_FLASH_M25P16) || defined(USE_FLASH_W25M) || defined(USE_FLASH_W25N) || defined(USE_FLASH_W25Q128FV) || defined(USE_FLASH_MX66UW1G45G)
+#if defined(USE_FLASH_M25P16) || defined(USE_FLASH_FM25V02A) || defined(USE_FLASH_W25M) || defined(USE_FLASH_W25N) || defined(USE_FLASH_W25Q128FV) || defined(USE_FLASH_MX66UW1G45G)
 #if !defined(USE_FLASH_CHIP)
 #define USE_FLASH_CHIP
 #endif
 #endif
 
-#if defined(USE_SPI) && (defined(USE_FLASH_M25P16) || defined(USE_FLASH_W25M512) || defined(USE_FLASH_W25N) || defined(USE_FLASH_W25M02G))
+#if defined(USE_SPI) && (defined(USE_FLASH_M25P16) || defined(USE_FLASH_FM25V02A) || defined(USE_FLASH_W25M512) || defined(USE_FLASH_W25N) || defined(USE_FLASH_W25M02G))
 #if !defined(USE_FLASH_SPI)
 #define USE_FLASH_SPI
 #endif
@@ -570,7 +575,7 @@
 
 // Generate USE_SPI_GYRO
 #if defined(USE_GYRO_SPI_ICM20689) || defined(USE_GYRO_SPI_MPU6000) || defined(USE_GYRO_SPI_MPU6500) || defined(USE_GYRO_SPI_MPU9250) \
-    || defined(USE_GYRO_L3GD20) || defined(USE_ACCGYRO_BMI160) || defined(USE_ACCGYRO_BMI270) \
+    || defined(USE_GYRO_L3GD20) || defined(USE_ACCGYRO_BMI160) || defined(USE_ACCGYRO_BMI270) || defined(USE_ACCGYRO_BMI088) \
     || defined(USE_GYRO_SPI_ICM42605) || defined(USE_ACCGYRO_ICM42622P) || defined(USE_ACCGYRO_ICM42686P) || defined(USE_GYRO_SPI_ICM42688P) \
     || defined(USE_ACCGYRO_ICM56686) \
     || defined(USE_ACCGYRO_ICM40609D) || defined(USE_ACCGYRO_ICM45605) || defined(USE_ACCGYRO_ICM45686) \

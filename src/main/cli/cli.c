@@ -3182,8 +3182,9 @@ RAM_CODE static void cliFlashInfo(const char *cmdName, char *cmdline)
 
     const flashGeometry_t *layout = flashGetGeometry();
 
-    cliPrintLinef("Flash sectors=%u, sectorSize=%u, pagesPerSector=%u, pageSize=%u, totalSize=%u JEDEC ID=0x%08x",
-            layout->sectors, layout->sectorSize, layout->pagesPerSector, layout->pageSize, layout->totalSize, layout->jedecId);
+    cliPrintLinef("Flash type=%s, sectors=%u, sectorSize=%u, pagesPerSector=%u, pageSize=%u, totalSize=%u JEDEC ID=0x%08x",
+            flashTypeGetName(layout->flashType), layout->sectors, layout->sectorSize, layout->pagesPerSector,
+            layout->pageSize, layout->totalSize, layout->jedecId);
 
     for (uint8_t index = 0; index < FLASH_MAX_PARTITIONS; index++) {
         const flashPartition_t *partition;
@@ -6838,6 +6839,7 @@ const cliResourceValue_t resourceTable[] = {
 #endif
     DEFW( OWNER_GYRO_EXTI,     PG_GYRO_DEVICE_CONFIG, gyroDeviceConfig_t, extiTag, MAX_GYRODEV_COUNT ),
     DEFW( OWNER_GYRO_CS,       PG_GYRO_DEVICE_CONFIG, gyroDeviceConfig_t, csnTag, MAX_GYRODEV_COUNT ),
+    DEFW( OWNER_ACC_CS,        PG_GYRO_DEVICE_CONFIG, gyroDeviceConfig_t, accCsnTag, MAX_GYRODEV_COUNT ),
 #if defined(USE_GYRO_CLKIN)
     DEFW( OWNER_GYRO_CLKIN,    PG_GYRO_DEVICE_CONFIG, gyroDeviceConfig_t, clkIn, MAX_GYRODEV_COUNT),
 #endif

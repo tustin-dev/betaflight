@@ -1,7 +1,7 @@
 [submodule "config"]
 	path = src/config
-	url = https://github.com/betaflight/config.git
-	branch = master
+	url = https://github.com/tustin-dev/config.git
+	branch = feature/tustin-mach-2026.6.2-sd-full
 	ignore = dirty
 [submodule "lib/modules/pico-sdk"]
 	path = lib/modules/pico-sdk
